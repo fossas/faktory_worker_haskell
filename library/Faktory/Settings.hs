@@ -9,7 +9,7 @@ module Faktory.Settings
   , namespaceQueue
   , queueArg
   , defaultQueue
-  , WorkerId
+  , WorkerId(..)
   , randomWorkerId
 
   -- * Re-exports
@@ -23,10 +23,10 @@ import Data.Aeson
 import Faktory.Connection
 import Faktory.JobOptions (JobOptions)
 import Faktory.Settings.Queue
+    ( Queue(..), namespaceQueue, queueArg, defaultQueue )
 import System.Environment (lookupEnv)
 import System.IO (hPutStrLn, stderr)
-import System.Random
-
+import System.Random ( newStdGen, Random(randomRs) )
 data Settings = Settings
   { settingsConnection :: ConnectionInfo
   , settingsLogDebug :: String -> IO ()

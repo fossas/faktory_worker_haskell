@@ -23,10 +23,9 @@ import Data.Aeson
 import Faktory.Connection
 import Faktory.JobOptions (JobOptions)
 import Faktory.Settings.Queue
-    ( Queue(..), namespaceQueue, queueArg, defaultQueue )
 import System.Environment (lookupEnv)
 import System.IO (hPutStrLn, stderr)
-import System.Random ( newStdGen, Random(randomRs) )
+import System.Random
 data Settings = Settings
   { settingsConnection :: ConnectionInfo
   , settingsLogDebug :: String -> IO ()

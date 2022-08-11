@@ -74,10 +74,10 @@ envWorkerSettings = do
     }
 
 newtype WorkerId = WorkerId String
-  deriving newtype (FromJSON, ToJSON, Show)
+  deriving newtype (FromJSON, ToJSON)
 
--- instance Show WorkerId where
---   show (WorkerId wid) = wid
+instance Show WorkerId where
+  show (WorkerId wid) = wid
 
 randomWorkerId :: IO WorkerId
 randomWorkerId = WorkerId . take 8 . randomRs ('a', 'z') <$> newStdGen

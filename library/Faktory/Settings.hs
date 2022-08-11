@@ -26,6 +26,7 @@ import Faktory.Settings.Queue
 import System.Environment (lookupEnv)
 import System.IO (hPutStrLn, stderr)
 import System.Random
+
 data Settings = Settings
   { settingsConnection :: ConnectionInfo
   , settingsLogDebug :: String -> IO ()

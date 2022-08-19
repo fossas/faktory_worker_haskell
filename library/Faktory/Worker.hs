@@ -20,6 +20,7 @@ import qualified Data.Text as T
 import Faktory.Client
 import Faktory.Job (Job, JobId, jobArg, jobJid, jobReserveForMicroseconds)
 import Faktory.Settings
+import GHC.Conc (TVar, newTVarIO, readTVarIO)
 import GHC.Generics
 import GHC.Stack
 import System.Timeout (timeout)
@@ -63,14 +64,15 @@ runWorker
   :: (HasCallStack, FromJSON args)
   => Settings
   -> WorkerSettings
+  -> TVar Bool
   -> (Job args -> IO ())
   -> IO ()
-runWorker settings workerSettings f = do
+runWorker settings workerSettings stopWorker f = do
   workerId <- maybe randomWorkerId pure $ settingsId workerSettings
   client <- newClient settings $ Just workerId
   beatThreadId <- forkIOWithThrowToParent $ forever $ heartBeat client workerId
 
-  forever (processorLoop client settings workerSettings f)
+  foreverUnless (readTVarIO stopWorker) (processorLoop client settings workerSettings f)
     `catch` (\(_ex :: WorkerHalt) -> pure ())
     `finally` (killThread beatThreadId >> closeClient client)
 
@@ -78,7 +80,8 @@ runWorkerEnv :: FromJSON args => (Job args -> IO ()) -> IO ()
 runWorkerEnv f = do
   settings <- envSettings
   workerSettings <- envWorkerSettings
-  runWorker settings workerSettings f
+  stopWorker <- newTVarIO False
+  runWorker settings workerSettings stopWorker f
 
 processorLoop
   :: (HasCallStack, FromJSON arg)
@@ -125,3 +128,7 @@ ackJob client job = commandOK client "ACK" [encode $ AckPayload $ jobJid job]
 failJob :: HasCallStack => Client -> Job args -> Text -> IO ()
 failJob client job message =
   commandOK client "FAIL" [encode $ FailPayload message "" (jobJid job) []]
+
+foreverUnless :: Monad m => m Bool -> m a -> m ()
+foreverUnless predicate action =
+  predicate >>= \a -> unless a (action *> foreverUnless predicate action)

@@ -81,7 +81,7 @@ forkWithThrowToParent :: Worker () -> Worker ThreadId
 forkWithThrowToParent action = do
   parent <- liftIO myThreadId
   workerConfig <- ask
-  liftIO $ forkIO $ (flip runReaderT workerConfig. runWorkerM $ action) `catchAny` \err -> throwTo parent err
+  liftIO $ forkIO $ (flip runReaderT workerConfig . runWorkerM $ action) `catchAny` \err -> throwTo parent err
 
 createWorker
   :: HasCallStack
@@ -110,11 +110,12 @@ startWorker
   -> Worker ()
 startWorker f = do
   config <- ask
-  liftIO $ flip runReaderT config . runWorkerM $ do
-    beatThreadId <- forkWithThrowToParent $ forever heartBeat
-    untilM_ shouldRunWorker (processorLoop f)
-      `catch` (\(_ex :: WorkerHalt) -> pure ())
-      `finally` killWorker beatThreadId
+  liftIO
+    $ flip runReaderT config . runWorkerM $ do
+      beatThreadId <- forkWithThrowToParent $ forever heartBeat
+      untilM_ shouldRunWorker (processorLoop f)
+        `catch` (\(_ex :: WorkerHalt) -> pure ())
+        `finally` killWorker beatThreadId
 
 shouldRunWorker :: Worker Bool
 shouldRunWorker = do

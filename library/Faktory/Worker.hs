@@ -5,25 +5,37 @@
 --
 module Faktory.Worker
   ( WorkerHalt(..)
+  , Worker(..)
   , runWorker
   , runWorkerEnv
+  , quietWorker
+  , createWorker
+  , startWorker
   , jobArg
   )
 where
 
 import Faktory.Prelude
-
-import Control.Concurrent (killThread)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
+import Control.Monad.Reader (MonadIO (..), MonadReader (ask), ReaderT (..))
 import Data.Aeson
 import Data.Aeson.Casing
 import qualified Data.Text as T
 import Faktory.Client
 import Faktory.Job (Job, JobId, jobArg, jobJid, jobReserveForMicroseconds)
 import Faktory.Settings
-import GHC.Conc (TVar, newTVarIO, readTVarIO)
+import GHC.Conc (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
 import GHC.Generics
 import GHC.Stack
 import System.Timeout (timeout)
+
+data WorkerConfig = WorkerConfig
+  { isQuiet :: TVar Bool
+  , client :: Client
+  , workerId :: WorkerId
+  , workerSettings :: WorkerSettings
+  , settings :: Settings
+  }
 
 -- | If processing functions @'throw'@ this, @'runWorker'@ will exit
 data WorkerHalt = WorkerHalt
@@ -48,6 +60,11 @@ instance ToJSON AckPayload where
   toJSON = genericToJSON $ aesonPrefix snakeCase
   toEncoding = genericToEncoding $ aesonPrefix snakeCase
 
+newtype Worker a = Worker
+  { runWorkerM :: ReaderT WorkerConfig IO a
+  }
+  deriving newtype (Functor, Applicative, Monad, MonadReader WorkerConfig, MonadIO, MonadThrow, MonadCatch, MonadMask)
+
 data FailPayload = FailPayload
   { _fpMessage :: Text
   , _fpErrtype :: String
@@ -60,75 +77,117 @@ instance ToJSON FailPayload where
   toJSON = genericToJSON $ aesonPrefix snakeCase
   toEncoding = genericToEncoding $ aesonPrefix snakeCase
 
+forkWithThrowToParent :: Worker () -> Worker ThreadId
+forkWithThrowToParent action = do
+  parent <- liftIO myThreadId
+  workerConfig <- ask
+  liftIO $ forkIO $ (flip runReaderT workerConfig. runWorkerM $ action) `catchAny` \err -> throwTo parent err
+
+createWorker
+  :: HasCallStack
+  => Settings
+  -> WorkerSettings
+  -> IO WorkerConfig
+createWorker settings workerSettings = do
+  workerId <- maybe randomWorkerId pure $ settingsId workerSettings
+  client <- newClient settings $ Just workerId
+  isQuiet <- newTVarIO False
+  pure $ WorkerConfig{isQuiet, workerId, client, workerSettings, settings}
+
 runWorker
   :: (HasCallStack, FromJSON args)
   => Settings
   -> WorkerSettings
-  -> TVar Bool
   -> (Job args -> IO ())
   -> IO ()
-runWorker settings workerSettings stopWorker f = do
-  workerId <- maybe randomWorkerId pure $ settingsId workerSettings
-  client <- newClient settings $ Just workerId
-  beatThreadId <- forkIOWithThrowToParent $ forever $ heartBeat client workerId
+runWorker settings workerSettings f = do
+  config <- createWorker settings workerSettings
+  flip runReaderT config . runWorkerM $ startWorker f
 
-  foreverUnless (readTVarIO stopWorker) (processorLoop client settings workerSettings f)
-    `catch` (\(_ex :: WorkerHalt) -> pure ())
-    `finally` (killThread beatThreadId >> closeClient client)
+startWorker
+  :: (HasCallStack, FromJSON args)
+  => (Job args -> IO ())
+  -> Worker ()
+startWorker f = do
+  config <- ask
+  liftIO $ flip runReaderT config . runWorkerM $ do
+    beatThreadId <- forkWithThrowToParent $ forever heartBeat
+    untilM_ shouldRunWorker (processorLoop f)
+      `catch` (\(_ex :: WorkerHalt) -> pure ())
+      `finally` killWorker beatThreadId
+
+shouldRunWorker :: Worker Bool
+shouldRunWorker = do
+  WorkerConfig{isQuiet} <- ask
+  liftIO $ readTVarIO isQuiet
 
 runWorkerEnv :: FromJSON args => (Job args -> IO ()) -> IO ()
 runWorkerEnv f = do
   settings <- envSettings
   workerSettings <- envWorkerSettings
-  stopWorker <- newTVarIO False
-  runWorker settings workerSettings stopWorker f
+  runWorker settings workerSettings f
+
+quietWorker :: Worker ()
+quietWorker = do
+  WorkerConfig{isQuiet} <- ask
+  liftIO $ atomically $ writeTVar isQuiet True
 
 processorLoop
   :: (HasCallStack, FromJSON arg)
-  => Client
-  -> Settings
-  -> WorkerSettings
-  -> (Job arg -> IO ())
-  -> IO ()
-processorLoop client settings workerSettings f = do
+  => (Job arg -> IO ())
+  -> Worker ()
+processorLoop f = do
+  WorkerConfig{settings, workerSettings} <- ask
   let
     namespace = connectionInfoNamespace $ settingsConnection settings
     processAndAck job = do
-      mResult <- timeout (jobReserveForMicroseconds job) $ f job
+      mResult <- liftIO $ timeout (jobReserveForMicroseconds job) $ f job
       case mResult of
-        Nothing -> settingsLogError settings "Job reservation period expired."
-        Just () -> ackJob client job
+        Nothing -> liftIO $ settingsLogError settings "Job reservation period expired."
+        Just () -> ackJob job
 
-  emJob <- fetchJob client $ namespaceQueue namespace $ settingsQueue
+  emJob <- fetchJob $ namespaceQueue namespace $ settingsQueue
     workerSettings
 
   case emJob of
-    Left err -> settingsLogError settings $ "Invalid Job: " <> err
-    Right Nothing -> threadDelaySeconds $ settingsIdleDelay workerSettings
+    Left err -> liftIO $ settingsLogError settings $ "Invalid Job: " <> err
+    Right Nothing -> liftIO $ threadDelaySeconds $ settingsIdleDelay workerSettings
     Right (Just job) ->
       processAndAck job
         `catches` [ Handler $ \(ex :: WorkerHalt) -> throw ex
                   , Handler $ \(ex :: SomeException) ->
-                    failJob client job $ T.pack $ show ex
+                    failJob job $ T.pack $ show ex
                   ]
 
 -- | <https://github.com/contribsys/faktory/wiki/Worker-Lifecycle#heartbeat>
-heartBeat :: Client -> WorkerId -> IO ()
-heartBeat client workerId = do
-  threadDelaySeconds 25
-  command_ client "BEAT" [encode $ BeatPayload workerId]
+heartBeat :: Worker ()
+heartBeat = do
+  WorkerConfig{client, workerId} <- ask
+  liftIO $ threadDelaySeconds 25
+  liftIO $ command_ client "BEAT" [encode $ BeatPayload workerId]
 
 fetchJob
-  :: FromJSON args => Client -> Queue -> IO (Either String (Maybe (Job args)))
-fetchJob client queue = commandJSON client "FETCH" [queueArg queue]
+  :: FromJSON args => Queue -> Worker (Either String (Maybe (Job args)))
+fetchJob queue = do
+  WorkerConfig{client} <- ask
+  liftIO $ commandJSON client "FETCH" [queueArg queue]
 
-ackJob :: HasCallStack => Client -> Job args -> IO ()
-ackJob client job = commandOK client "ACK" [encode $ AckPayload $ jobJid job]
+ackJob :: HasCallStack => Job args -> Worker ()
+ackJob job = do
+  WorkerConfig{client} <- ask
+  liftIO $ commandOK client "ACK" [encode $ AckPayload $ jobJid job]
 
-failJob :: HasCallStack => Client -> Job args -> Text -> IO ()
-failJob client job message =
-  commandOK client "FAIL" [encode $ FailPayload message "" (jobJid job) []]
+failJob :: HasCallStack => Job args -> Text -> Worker ()
+failJob job message = do
+  WorkerConfig{client} <- ask
+  liftIO $ commandOK client "FAIL" [encode $ FailPayload message "" (jobJid job) []]
 
-foreverUnless :: Monad m => m Bool -> m a -> m ()
-foreverUnless predicate action =
-  predicate >>= \a -> unless a (action *> foreverUnless predicate action)
+untilM_ :: Monad m => m Bool -> m a -> m ()
+untilM_ predicate action =
+  predicate >>= \a -> unless a (action *> untilM_ predicate action)
+
+killWorker :: ThreadId -> Worker ()
+killWorker beatThreadId = do
+  WorkerConfig{client} <- ask
+  liftIO $ killThread beatThreadId
+  liftIO $ closeClient client

@@ -30,7 +30,7 @@ import GHC.Stack
 import System.Timeout (timeout)
 
 data WorkerConfig = WorkerConfig
-  { isQuiet :: TVar Bool
+  { isQuieted :: TVar Bool
   , client :: Client
   , workerId :: WorkerId
   , workerSettings :: WorkerSettings
@@ -91,8 +91,8 @@ createWorker
 createWorker settings workerSettings = do
   workerId <- maybe randomWorkerId pure $ settingsId workerSettings
   client <- newClient settings $ Just workerId
-  isQuiet <- newTVarIO False
-  pure $ WorkerConfig{isQuiet, workerId, client, workerSettings, settings}
+  isQuieted <- newTVarIO False
+  pure $ WorkerConfig{isQuieted, workerId, client, workerSettings, settings}
 
 runWorker
   :: (HasCallStack, FromJSON args)
@@ -113,14 +113,14 @@ startWorker f = do
   liftIO
     $ flip runReaderT config . runWorkerM $ do
       beatThreadId <- forkWithThrowToParent $ forever heartBeat
-      untilM_ shouldRunWorker (processorLoop f)
+      untilM_ shouldStopWorker (processorLoop f)
         `catch` (\(_ex :: WorkerHalt) -> pure ())
         `finally` killWorker beatThreadId
 
-shouldRunWorker :: Worker Bool
-shouldRunWorker = do
-  WorkerConfig{isQuiet} <- ask
-  liftIO $ readTVarIO isQuiet
+shouldStopWorker :: Worker Bool
+shouldStopWorker = do
+  WorkerConfig{isQuieted} <- ask
+  liftIO $ readTVarIO isQuieted
 
 runWorkerEnv :: FromJSON args => (Job args -> IO ()) -> IO ()
 runWorkerEnv f = do
@@ -130,8 +130,8 @@ runWorkerEnv f = do
 
 quietWorker :: Worker ()
 quietWorker = do
-  WorkerConfig{isQuiet} <- ask
-  liftIO $ atomically $ writeTVar isQuiet True
+  WorkerConfig{isQuieted} <- ask
+  liftIO $ atomically $ writeTVar isQuieted True
 
 processorLoop
   :: (HasCallStack, FromJSON arg)

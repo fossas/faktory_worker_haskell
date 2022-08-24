@@ -89,10 +89,10 @@ withRunWorker ::
   (HasCallStack, FromJSON args)
   =>  Settings
   -> WorkerSettings
-  -> (Job args -> IO ())
   -> (WorkerConfig -> IO a)
+  -> (Job args -> IO ())
   -> IO ()
-withRunWorker settings workerSettings handler action =
+withRunWorker settings workerSettings action handler =
   bracket
     (configureWorker settings workerSettings)
     stopWorker

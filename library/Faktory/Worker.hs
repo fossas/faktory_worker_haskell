@@ -14,8 +14,8 @@ module Faktory.Worker (
 ) where
 
 import Faktory.Prelude
-import Control.Concurrent (forkIO, killThread)
-import Control.Monad.Reader (MonadIO (..), MonadReader (ask), ReaderT (..))
+import Control.Concurrent (killThread)
+import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT (runReaderT))
 import Data.Aeson
 import Data.Aeson.Casing
 import qualified Data.Text as T
@@ -86,10 +86,9 @@ untilM_ predicate action = do
         untilM_ predicate action
     )
 
--- | Creates a new faktory worker. @'action'@ is ran with @'WorkerConfig'@ before
--- continuously polls the faktory server for jobs. Jobs are passed to
--- @'handler'@. Polling stops once the worker is quieted.
-
+-- | Creates a new faktory worker, @'action'@ is ran with @'WorkerConfig'@ before
+-- polling begins. Jobs received are passed to @'handler'. The worker's
+-- connection is closed when job processing ends.
 withRunWorker ::
   (HasCallStack, FromJSON args)
   =>  Settings
@@ -98,16 +97,14 @@ withRunWorker ::
   -> (Job args -> IO ())
   -> IO ()
 withRunWorker settings workerSettings action handler =
-  bracket
-    (configureWorker settings workerSettings)
-    stopWorker
-    ( \config -> do
+  configureWorker settings workerSettings
+    $ \config -> do
         void $ action config
         runWorkerWithConfig handler config
-    )
 
--- | Creates a new faktory worker and continuously polls the faktory server for
---- jobs which are passed to @'handler'@. Polling stops once the worker is quieted.
+-- | Creates a new faktory worker, continuously polls the faktory server for
+--- jobs which are passed to @'handler'@. The worker's connection is closed
+-- when job processing ends.
 runWorker
   :: (HasCallStack, FromJSON args)
   => Settings
@@ -115,14 +112,14 @@ runWorker
   -> (Job args -> IO ())
   -> IO ()
 runWorker settings workerSettings handler =
-  bracket
-    (configureWorker settings workerSettings)
-    stopWorker
-    (runWorkerWithConfig handler)
+  configureWorker settings workerSettings
+    $ runWorkerWithConfig handler
 
+-- | Creates a heartbeat thread and continuously polls jobs from the faktory
+-- server. The thread is killed when the loop stops.
 runWorkerWithConfig :: FromJSON arg => (Job arg -> IO ()) -> WorkerConfig -> IO ()
 runWorkerWithConfig handler config = do
-  beatThreadId <- forkIO $ forever $ heartBeat config
+  beatThreadId <- forkIOWithThrowToParent $ forever $ heartBeat config
   finally
     ( flip runReaderT config . runWorkerM $
         untilM_ shouldStopWorker (processorLoop handler)
@@ -130,15 +127,23 @@ runWorkerWithConfig handler config = do
     )
     $ killThread beatThreadId
 
-configureWorker :: HasCallStack => Settings -> WorkerSettings -> IO WorkerConfig
-configureWorker settings workerSettings = do
-  workerId <- maybe randomWorkerId pure $ settingsId workerSettings
-  isQuieted <- newTVarIO False
-  client <- newClient settings $ Just workerId
-  pure $ WorkerConfig{isQuieted, workerId, client, workerSettings, settings}
-
-stopWorker :: WorkerConfig -> IO ()
-stopWorker WorkerConfig{client} = closeClient client
+-- | Creates a new @'WorkerConfig'@ and connects to the faktory server. The
+-- worker's client connection is closed after the action completes.
+configureWorker
+  :: HasCallStack
+  => Settings
+  -> WorkerSettings
+  -> (WorkerConfig -> IO a)
+  -> IO a
+configureWorker settings workerSettings =
+  bracket
+    ( do
+        workerId <- maybe randomWorkerId pure $ settingsId workerSettings
+        isQuieted <- newTVarIO False
+        client <- newClient settings $ Just workerId
+        pure $ WorkerConfig{isQuieted, workerId, client, workerSettings, settings}
+    )
+    (\WorkerConfig{client} -> closeClient client)
 
 runWorkerEnv :: FromJSON args => (Job args -> IO ()) -> IO ()
 runWorkerEnv f = do
@@ -146,9 +151,10 @@ runWorkerEnv f = do
   workerSettings <- envWorkerSettings
   runWorker settings workerSettings f
 
+-- | Quiet's a worker so that it no longer polls for jobs.
 quietWorker :: WorkerConfig -> IO ()
 quietWorker WorkerConfig{isQuieted} = do
-  liftIO $ atomically $ writeTVar isQuieted True
+  atomically $ writeTVar isQuieted True
 
 shouldStopWorker :: Worker Bool
 shouldStopWorker = do

@@ -5,7 +5,7 @@
 --
 module Faktory.Worker (
   WorkerHalt (..),
-  WorkerConfig (isQuieted, client, workerId, beatThreadId, workerSettings, settings),
+  WorkerConfig (isQuieted, client, workerId, workerSettings, settings),
   runWorker,
   runWorkerEnv,
   withRunWorker,
@@ -14,7 +14,7 @@ module Faktory.Worker (
 ) where
 
 import Faktory.Prelude
-import Control.Concurrent (ThreadId, forkIO, killThread)
+import Control.Concurrent (forkIO, killThread)
 import Control.Monad.Reader (MonadIO (..), MonadReader (ask), ReaderT (..))
 import Data.Aeson
 import Data.Aeson.Casing
@@ -32,7 +32,6 @@ data WorkerConfig = WorkerConfig
   { isQuieted :: TVar Bool
   , client :: Client
   , workerId :: WorkerId
-  , beatThreadId :: ThreadId
   , workerSettings :: WorkerSettings
   , settings :: Settings
   }
@@ -85,36 +84,19 @@ untilM_ predicate action = do
 -- | Creates a new faktory worker. @'action'@ is ran with @'WorkerConfig'@ before
 -- continuously polls the faktory server for jobs. Jobs are passed to
 -- @'handler'@. Polling stops once the worker is quieted.
-withRunWorker
-  :: (HasCallStack, FromJSON args)
-  => Settings
+
+withRunWorker ::
+  (HasCallStack, FromJSON args)
+  =>  Settings
   -> WorkerSettings
   -> (Job args -> IO ())
-  -> (WorkerConfig -> IO ())
+  -> (WorkerConfig -> IO a)
   -> IO ()
-withRunWorker settings workerSettings handler action = do
+withRunWorker settings workerSettings handler action =
   bracket
-    (createWorker settings workerSettings)
-    killWorker
+    (configureWorker settings workerSettings)
+    stopWorker
     (action *> runWorkerWithConfig handler)
-
-createWorker :: Settings -> WorkerSettings -> IO WorkerConfig
-createWorker settings workerSettings = do
-  workerId <- maybe randomWorkerId pure $ settingsId workerSettings
-  client <- newClient settings $ Just workerId
-  isQuieted <- newTVarIO False
-  beatThreadId <- forkIO $ forever heartBeat client workerId
-  pure $ WorkerConfig{isQuieted, workerId, client, workerSettings, settings, beatThreadId}
-
-runWorkerWithConfig
-  :: (HasCallStack, FromJSON arg)
-  => (Job arg -> IO ())
-  -> WorkerConfig
-  -> IO ()
-runWorkerWithConfig handler config =
-  flip runReaderT config . runWorkerM $ do
-    untilM_ shouldStopWorker (processorLoop handler)
-      `catch` (\(_ex :: WorkerHalt) -> pure ())
 
 -- | Creates a new faktory worker and continuously polls the faktory server for
 --- jobs which are passed to @'handler'@. Polling stops once the worker is quieted.
@@ -124,11 +106,31 @@ runWorker
   -> WorkerSettings
   -> (Job args -> IO ())
   -> IO ()
-runWorker settings workerSettings handler = do
- bracket
-    (createWorker settings workerSettings)
-    killWorker
+runWorker settings workerSettings handler =
+  bracket
+    (configureWorker settings workerSettings)
+    stopWorker
     (runWorkerWithConfig handler)
+
+runWorkerWithConfig :: FromJSON arg => (Job arg -> IO ()) -> WorkerConfig -> IO ()
+runWorkerWithConfig handler config = do
+  beatThreadId <- forkIO $ forever $ heartBeat config
+  finally
+    ( flip runReaderT config . runWorkerM $
+        untilM_ shouldStopWorker (processorLoop handler)
+          `catch` (\(_ex :: WorkerHalt) -> pure ())
+    )
+    $ killThread beatThreadId
+
+configureWorker :: HasCallStack => Settings -> WorkerSettings -> IO WorkerConfig
+configureWorker settings workerSettings = do
+  workerId <- maybe randomWorkerId pure $ settingsId workerSettings
+  isQuieted <- newTVarIO False
+  client <- newClient settings $ Just workerId
+  pure $ WorkerConfig{isQuieted, workerId, client, workerSettings, settings}
+
+stopWorker :: WorkerConfig -> IO ()
+stopWorker WorkerConfig{client} = closeClient client
 
 runWorkerEnv :: FromJSON args => (Job args -> IO ()) -> IO ()
 runWorkerEnv f = do
@@ -139,11 +141,6 @@ runWorkerEnv f = do
 quietWorker :: WorkerConfig -> IO ()
 quietWorker WorkerConfig{isQuieted} = do
   liftIO $ atomically $ writeTVar isQuieted True
-
-killWorker :: WorkerConfig -> IO ()
-killWorker WorkerConfig{client, beatThreadId} = do
-  killThread beatThreadId
-  closeClient client
 
 shouldStopWorker :: Worker Bool
 shouldStopWorker = do
@@ -178,8 +175,8 @@ processorLoop f = do
                   ]
 
 -- | <https://github.com/contribsys/faktory/wiki/Worker-Lifecycle#heartbeat>
-heartBeat :: Client -> WorkerId -> IO ()
-heartBeat client workerId = do
+heartBeat :: WorkerConfig -> IO ()
+heartBeat WorkerConfig{client, workerId} = do
   threadDelaySeconds 25
   command_ client "BEAT" [encode $ BeatPayload workerId]
 

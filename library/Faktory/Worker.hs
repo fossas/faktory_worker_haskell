@@ -79,7 +79,12 @@ instance ToJSON FailPayload where
 untilM_ :: Monad m => m Bool -> m a -> m ()
 untilM_ predicate action = do
   result <- predicate
-  unless result (action *> untilM_ predicate action)
+  unless
+    result
+    ( do
+        void action
+        untilM_ predicate action
+    )
 
 -- | Creates a new faktory worker. @'action'@ is ran with @'WorkerConfig'@ before
 -- continuously polls the faktory server for jobs. Jobs are passed to
@@ -96,7 +101,10 @@ withRunWorker settings workerSettings action handler =
   bracket
     (configureWorker settings workerSettings)
     stopWorker
-    (action *> runWorkerWithConfig handler)
+    ( \config -> do
+        void $ action config
+        runWorkerWithConfig handler config
+    )
 
 -- | Creates a new faktory worker and continuously polls the faktory server for
 --- jobs which are passed to @'handler'@. Polling stops once the worker is quieted.

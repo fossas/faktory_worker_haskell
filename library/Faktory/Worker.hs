@@ -3,20 +3,18 @@
 -- Runs forever, @FETCH@-ing Jobs from the given Queue and handing each to your
 -- processing function.
 --
-module Faktory.Worker
-  ( WorkerHalt(..)
-  , Worker(..)
-  , runWorker
-  , runWorkerEnv
-  , quietWorker
-  , createWorker
-  , startWorker
-  , jobArg
-  )
-where
+module Faktory.Worker (
+  WorkerHalt (..),
+  WorkerConfig (isQuieted, client, workerId, beatThreadId, workerSettings, settings),
+  runWorker,
+  runWorkerEnv,
+  withRunWorker,
+  quietWorker,
+  jobArg,
+) where
 
 import Faktory.Prelude
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
+import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Monad.Reader (MonadIO (..), MonadReader (ask), ReaderT (..))
 import Data.Aeson
 import Data.Aeson.Casing
@@ -29,10 +27,12 @@ import GHC.Generics
 import GHC.Stack
 import System.Timeout (timeout)
 
+-- | State information for a faktory worker.
 data WorkerConfig = WorkerConfig
   { isQuieted :: TVar Bool
   , client :: Client
   , workerId :: WorkerId
+  , beatThreadId :: ThreadId
   , workerSettings :: WorkerSettings
   , settings :: Settings
   }
@@ -77,50 +77,58 @@ instance ToJSON FailPayload where
   toJSON = genericToJSON $ aesonPrefix snakeCase
   toEncoding = genericToEncoding $ aesonPrefix snakeCase
 
-forkWithThrowToParent :: Worker () -> Worker ThreadId
-forkWithThrowToParent action = do
-  parent <- liftIO myThreadId
-  workerConfig <- ask
-  liftIO $ forkIO $ (flip runReaderT workerConfig . runWorkerM $ action) `catchAny` \err -> throwTo parent err
+untilM_ :: Monad m => m Bool -> m a -> m ()
+untilM_ predicate action = do
+  result <- predicate
+  unless result (action *> untilM_ predicate action)
 
-createWorker
-  :: HasCallStack
+-- | Creates a new faktory worker. @'action'@ is ran with @'WorkerConfig'@ before
+-- continuously polls the faktory server for jobs. Jobs are passed to
+-- @'handler'@. Polling stops once the worker is quieted.
+withRunWorker
+  :: (HasCallStack, FromJSON args)
   => Settings
   -> WorkerSettings
-  -> IO WorkerConfig
+  -> (Job args -> IO ())
+  -> (WorkerConfig -> IO ())
+  -> IO ()
+withRunWorker settings workerSettings handler action = do
+  bracket
+    (createWorker settings workerSettings)
+    killWorker
+    (action *> runWorkerWithConfig handler)
+
+createWorker :: Settings -> WorkerSettings -> IO WorkerConfig
 createWorker settings workerSettings = do
   workerId <- maybe randomWorkerId pure $ settingsId workerSettings
   client <- newClient settings $ Just workerId
   isQuieted <- newTVarIO False
-  pure $ WorkerConfig{isQuieted, workerId, client, workerSettings, settings}
+  beatThreadId <- forkIO $ forever heartBeat client workerId
+  pure $ WorkerConfig{isQuieted, workerId, client, workerSettings, settings, beatThreadId}
 
+runWorkerWithConfig
+  :: (HasCallStack, FromJSON arg)
+  => (Job arg -> IO ())
+  -> WorkerConfig
+  -> IO ()
+runWorkerWithConfig handler config =
+  flip runReaderT config . runWorkerM $ do
+    untilM_ shouldStopWorker (processorLoop handler)
+      `catch` (\(_ex :: WorkerHalt) -> pure ())
+
+-- | Creates a new faktory worker and continuously polls the faktory server for
+--- jobs which are passed to @'handler'@. Polling stops once the worker is quieted.
 runWorker
   :: (HasCallStack, FromJSON args)
   => Settings
   -> WorkerSettings
   -> (Job args -> IO ())
   -> IO ()
-runWorker settings workerSettings f = do
-  config <- createWorker settings workerSettings
-  flip runReaderT config . runWorkerM $ startWorker f
-
-startWorker
-  :: (HasCallStack, FromJSON args)
-  => (Job args -> IO ())
-  -> Worker ()
-startWorker f = do
-  config <- ask
-  liftIO
-    $ flip runReaderT config . runWorkerM $ do
-      beatThreadId <- forkWithThrowToParent $ forever heartBeat
-      untilM_ shouldStopWorker (processorLoop f)
-        `catch` (\(_ex :: WorkerHalt) -> pure ())
-        `finally` killWorker beatThreadId
-
-shouldStopWorker :: Worker Bool
-shouldStopWorker = do
-  WorkerConfig{isQuieted} <- ask
-  liftIO $ readTVarIO isQuieted
+runWorker settings workerSettings handler = do
+ bracket
+    (createWorker settings workerSettings)
+    killWorker
+    (runWorkerWithConfig handler)
 
 runWorkerEnv :: FromJSON args => (Job args -> IO ()) -> IO ()
 runWorkerEnv f = do
@@ -128,10 +136,19 @@ runWorkerEnv f = do
   workerSettings <- envWorkerSettings
   runWorker settings workerSettings f
 
-quietWorker :: Worker ()
-quietWorker = do
-  WorkerConfig{isQuieted} <- ask
+quietWorker :: WorkerConfig -> IO ()
+quietWorker WorkerConfig{isQuieted} = do
   liftIO $ atomically $ writeTVar isQuieted True
+
+killWorker :: WorkerConfig -> IO ()
+killWorker WorkerConfig{client, beatThreadId} = do
+  killThread beatThreadId
+  closeClient client
+
+shouldStopWorker :: Worker Bool
+shouldStopWorker = do
+  WorkerConfig{isQuieted} <- ask
+  liftIO $ readTVarIO isQuieted
 
 processorLoop
   :: (HasCallStack, FromJSON arg)
@@ -161,11 +178,10 @@ processorLoop f = do
                   ]
 
 -- | <https://github.com/contribsys/faktory/wiki/Worker-Lifecycle#heartbeat>
-heartBeat :: Worker ()
-heartBeat = do
-  WorkerConfig{client, workerId} <- ask
-  liftIO $ threadDelaySeconds 25
-  liftIO $ command_ client "BEAT" [encode $ BeatPayload workerId]
+heartBeat :: Client -> WorkerId -> IO ()
+heartBeat client workerId = do
+  threadDelaySeconds 25
+  command_ client "BEAT" [encode $ BeatPayload workerId]
 
 fetchJob
   :: FromJSON args => Queue -> Worker (Either String (Maybe (Job args)))
@@ -182,13 +198,3 @@ failJob :: HasCallStack => Job args -> Text -> Worker ()
 failJob job message = do
   WorkerConfig{client} <- ask
   liftIO $ commandOK client "FAIL" [encode $ FailPayload message "" (jobJid job) []]
-
-untilM_ :: Monad m => m Bool -> m a -> m ()
-untilM_ predicate action =
-  predicate >>= \a -> unless a (action *> untilM_ predicate action)
-
-killWorker :: ThreadId -> Worker ()
-killWorker beatThreadId = do
-  WorkerConfig{client} <- ask
-  liftIO $ killThread beatThreadId
-  liftIO $ closeClient client

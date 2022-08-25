@@ -5,7 +5,7 @@
 --
 module Faktory.Worker (
   WorkerHalt (..),
-  WorkerConfig (isQuieted, client, workerId, workerSettings, settings),
+  WorkerConfig (..),
   runWorker,
   runWorkerEnv,
   withRunWorker,
@@ -87,7 +87,7 @@ untilM_ predicate action = do
     )
 
 -- | Creates a new faktory worker, @'action'@ is ran with @'WorkerConfig'@ before
--- polling begins. Jobs received are passed to @'handler'. The worker's
+-- polling begins. Jobs received are passed to @'handler'@. The worker's
 -- connection is closed when job processing ends.
 withRunWorker ::
   (HasCallStack, FromJSON args)

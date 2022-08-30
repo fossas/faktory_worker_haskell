@@ -62,7 +62,7 @@ instance ToJSON AckPayload where
   toJSON = genericToJSON $ aesonPrefix snakeCase
   toEncoding = genericToEncoding $ aesonPrefix snakeCase
 
-newtype MonadWorker a = WorkerReader
+newtype WorkerM a = WorkerReader
   { runWorkerM :: ReaderT Worker IO a
   }
   deriving newtype (Functor, Applicative, Monad, MonadReader Worker, MonadIO, MonadThrow, MonadCatch, MonadMask)
@@ -154,7 +154,7 @@ quietWorker :: Worker -> IO ()
 quietWorker Worker{isQuieted} = do
   atomically $ writeTVar isQuieted True
 
-shouldStopWorker :: MonadWorker Bool
+shouldStopWorker :: WorkerM Bool
 shouldStopWorker = do
   Worker{isQuieted} <- ask
   liftIO $ readTVarIO isQuieted
@@ -162,7 +162,7 @@ shouldStopWorker = do
 processorLoop
   :: (HasCallStack, FromJSON arg)
   => (Job arg -> IO ())
-  -> MonadWorker ()
+  -> WorkerM ()
 processorLoop f = do
   Worker{settings, workerSettings} <- ask
   let
@@ -193,17 +193,17 @@ heartBeat Worker{client, workerId} = do
   command_ client "BEAT" [encode $ BeatPayload workerId]
 
 fetchJob
-  :: FromJSON args => Queue -> MonadWorker (Either String (Maybe (Job args)))
+  :: FromJSON args => Queue -> WorkerM (Either String (Maybe (Job args)))
 fetchJob queue = do
   Worker{client} <- ask
   liftIO $ commandJSON client "FETCH" [queueArg queue]
 
-ackJob :: HasCallStack => Job args -> MonadWorker ()
+ackJob :: HasCallStack => Job args -> WorkerM ()
 ackJob job = do
   Worker{client} <- ask
   liftIO $ commandOK client "ACK" [encode $ AckPayload $ jobJid job]
 
-failJob :: HasCallStack => Job args -> Text -> MonadWorker ()
+failJob :: HasCallStack => Job args -> Text -> WorkerM ()
 failJob job message = do
   Worker{client} <- ask
   liftIO $ commandOK client "FAIL" [encode $ FailPayload message "" (jobJid job) []]

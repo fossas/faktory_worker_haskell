@@ -10,7 +10,7 @@ module Faktory.Worker (
   runWorker,
   runWorkerEnv,
   startWorker,
-  untilWorkerDone,
+  waitUntilDone,
   quietWorker,
   jobArg,
 ) where
@@ -137,7 +137,7 @@ runWorker
   -> IO ()
 runWorker settings workerSettings handler = do
   (_, worker) <- startWorker settings workerSettings handler
-  untilWorkerDone worker
+  waitUntilDone worker
 
 runWorkerEnv :: FromJSON args => (Job args -> IO ()) -> IO ()
 runWorkerEnv f = do
@@ -146,8 +146,8 @@ runWorkerEnv f = do
   runWorker settings workerSettings f
 
 -- | Blocks until the worker thread has completed.
-untilWorkerDone :: Worker -> IO ()
-untilWorkerDone Worker{isDone} = takeMVar isDone
+waitUntilDone :: Worker -> IO ()
+waitUntilDone Worker{isDone} = takeMVar isDone
 
 -- | Quiet's a worker so that it no longer polls for jobs.
 quietWorker :: Worker -> IO ()

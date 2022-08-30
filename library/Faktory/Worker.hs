@@ -5,16 +5,18 @@
 --
 module Faktory.Worker (
   WorkerHalt (..),
-  WorkerConfig (..),
+  Worker,
+  workerID,
   runWorker,
   runWorkerEnv,
-  withRunWorker,
+  startWorker,
+  untilWorkerDone,
   quietWorker,
   jobArg,
 ) where
 
 import Faktory.Prelude
-import Control.Concurrent (killThread)
+import Control.Concurrent (MVar, forkFinally, killThread, newEmptyMVar, putMVar, takeMVar)
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT (runReaderT))
 import Data.Aeson
 import Data.Aeson.Casing
@@ -28,12 +30,13 @@ import GHC.Stack
 import System.Timeout (timeout)
 
 -- | State information for a faktory worker.
-data WorkerConfig = WorkerConfig
-  { isQuieted :: TVar Bool
-  , client :: Client
+data Worker = Worker
+  { client :: Client
+  , isDone :: MVar ()
+  , isQuieted :: TVar Bool
+  , settings :: Settings
   , workerId :: WorkerId
   , workerSettings :: WorkerSettings
-  , settings :: Settings
   }
 
 -- | If processing functions @'throw'@ this, @'runWorker'@ will exit
@@ -59,10 +62,10 @@ instance ToJSON AckPayload where
   toJSON = genericToJSON $ aesonPrefix snakeCase
   toEncoding = genericToEncoding $ aesonPrefix snakeCase
 
-newtype Worker a = Worker
-  { runWorkerM :: ReaderT WorkerConfig IO a
+newtype WorkerM a = WorkerM
+  { runWorkerM :: ReaderT Worker IO a
   }
-  deriving newtype (Functor, Applicative, Monad, MonadReader WorkerConfig, MonadIO, MonadThrow, MonadCatch, MonadMask)
+  deriving newtype (Functor, Applicative, Monad, MonadReader Worker, MonadIO, MonadThrow, MonadCatch, MonadMask)
 
 data FailPayload = FailPayload
   { _fpMessage :: Text
@@ -86,21 +89,45 @@ untilM_ predicate action = do
         untilM_ predicate action
     )
 
--- | Creates a new faktory worker, @'action'@ is ran with @'WorkerConfig'@ before
--- polling begins. Jobs received are passed to @'handler'@. The worker's
--- connection is closed when job processing ends.
-withRunWorker ::
-  (HasCallStack, FromJSON args)
+-- | Returns the workerId associated with a Worker.
+workerID :: Worker -> WorkerId
+workerID Worker{workerId} = workerId
+
+-- | Forks a new faktory worker, continuously polls the faktory server for
+-- jobs which are passed to @'handler'@. Returns a Worker state that can be
+-- used to quiet the worker.
+startWorker
+  :: (HasCallStack, FromJSON args)
   =>  Settings
   -> WorkerSettings
-  -> (WorkerConfig -> IO a)
   -> (Job args -> IO ())
-  -> IO ()
-withRunWorker settings workerSettings action handler =
-  configureWorker settings workerSettings
-    $ \config -> do
-        void $ action config
-        runWorkerWithConfig handler config
+  -> IO Worker
+startWorker settings workerSettings handler = do
+  workerId <- maybe randomWorkerId pure $ settingsId workerSettings
+  isQuieted <- newTVarIO False
+  client <- newClient settings $ Just workerId
+  isDone <- newEmptyMVar
+  let worker = Worker{client, workerId, settings, workerSettings, isQuieted, isDone}
+  _ <-
+    finally
+      ( forkFinally
+          ( do
+              beatThreadId <- forkIOWithThrowToParent $ forever $ heartBeat worker
+              finally
+                ( flip runReaderT worker . runWorkerM $
+                    untilM_ shouldStopWorker (processorLoop handler)
+                      `catch` (\(_ex :: WorkerHalt) -> pure ())
+                )
+                $ killThread beatThreadId
+          )
+          (\_ -> putMVar isDone ())
+      )
+      $ closeClient client
+  pure worker
+
+-- | Blocks the thread until the worker thread has completed.
+untilWorkerDone :: Worker -> IO ()
+untilWorkerDone Worker{isDone} = takeMVar isDone
 
 -- | Creates a new faktory worker, continuously polls the faktory server for
 --- jobs which are passed to @'handler'@. The worker's connection is closed
@@ -111,39 +138,9 @@ runWorker
   -> WorkerSettings
   -> (Job args -> IO ())
   -> IO ()
-runWorker settings workerSettings handler =
-  configureWorker settings workerSettings
-    $ runWorkerWithConfig handler
-
--- | Creates a heartbeat thread and continuously polls jobs from the faktory
--- server. The thread is killed when the loop stops.
-runWorkerWithConfig :: FromJSON arg => (Job arg -> IO ()) -> WorkerConfig -> IO ()
-runWorkerWithConfig handler config = do
-  beatThreadId <- forkIOWithThrowToParent $ forever $ heartBeat config
-  finally
-    ( flip runReaderT config . runWorkerM $
-        untilM_ shouldStopWorker (processorLoop handler)
-          `catch` (\(_ex :: WorkerHalt) -> pure ())
-    )
-    $ killThread beatThreadId
-
--- | Creates a new @'WorkerConfig'@ and connects to the faktory server. The
--- worker's client connection is closed after the action completes.
-configureWorker
-  :: HasCallStack
-  => Settings
-  -> WorkerSettings
-  -> (WorkerConfig -> IO a)
-  -> IO a
-configureWorker settings workerSettings =
-  bracket
-    ( do
-        workerId <- maybe randomWorkerId pure $ settingsId workerSettings
-        isQuieted <- newTVarIO False
-        client <- newClient settings $ Just workerId
-        pure $ WorkerConfig{isQuieted, workerId, client, workerSettings, settings}
-    )
-    (\WorkerConfig{client} -> closeClient client)
+runWorker settings workerSettings handler = do
+  worker <- startWorker settings workerSettings handler
+  untilWorkerDone worker
 
 runWorkerEnv :: FromJSON args => (Job args -> IO ()) -> IO ()
 runWorkerEnv f = do
@@ -152,21 +149,21 @@ runWorkerEnv f = do
   runWorker settings workerSettings f
 
 -- | Quiet's a worker so that it no longer polls for jobs.
-quietWorker :: WorkerConfig -> IO ()
-quietWorker WorkerConfig{isQuieted} = do
+quietWorker :: Worker -> IO ()
+quietWorker Worker{isQuieted} = do
   atomically $ writeTVar isQuieted True
 
-shouldStopWorker :: Worker Bool
+shouldStopWorker :: WorkerM Bool
 shouldStopWorker = do
-  WorkerConfig{isQuieted} <- ask
+  Worker{isQuieted} <- ask
   liftIO $ readTVarIO isQuieted
 
 processorLoop
   :: (HasCallStack, FromJSON arg)
   => (Job arg -> IO ())
-  -> Worker ()
+  -> WorkerM ()
 processorLoop f = do
-  WorkerConfig{settings, workerSettings} <- ask
+  Worker{settings, workerSettings} <- ask
   let
     namespace = connectionInfoNamespace $ settingsConnection settings
     processAndAck job = do
@@ -189,23 +186,22 @@ processorLoop f = do
                   ]
 
 -- | <https://github.com/contribsys/faktory/wiki/Worker-Lifecycle#heartbeat>
-heartBeat :: WorkerConfig -> IO ()
-heartBeat WorkerConfig{client, workerId} = do
+heartBeat :: Worker -> IO ()
+heartBeat Worker{client, workerId} = do
   threadDelaySeconds 25
   command_ client "BEAT" [encode $ BeatPayload workerId]
-
 fetchJob
-  :: FromJSON args => Queue -> Worker (Either String (Maybe (Job args)))
+  :: FromJSON args => Queue -> WorkerM (Either String (Maybe (Job args)))
 fetchJob queue = do
-  WorkerConfig{client} <- ask
+  Worker{client} <- ask
   liftIO $ commandJSON client "FETCH" [queueArg queue]
 
-ackJob :: HasCallStack => Job args -> Worker ()
+ackJob :: HasCallStack => Job args -> WorkerM ()
 ackJob job = do
-  WorkerConfig{client} <- ask
+  Worker{client} <- ask
   liftIO $ commandOK client "ACK" [encode $ AckPayload $ jobJid job]
 
-failJob :: HasCallStack => Job args -> Text -> Worker ()
+failJob :: HasCallStack => Job args -> Text -> WorkerM ()
 failJob job message = do
-  WorkerConfig{client} <- ask
+  Worker{client} <- ask
   liftIO $ commandOK client "FAIL" [encode $ FailPayload message "" (jobJid job) []]

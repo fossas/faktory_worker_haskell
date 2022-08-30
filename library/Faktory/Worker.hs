@@ -89,13 +89,13 @@ untilM_ predicate action = do
         untilM_ predicate action
     )
 
--- | Returns the workerId associated with a Worker.
+-- | Returns the @'WorkerId' associated with a @'Worker'.
 workerID :: Worker -> WorkerId
 workerID Worker{workerId} = workerId
 
 -- | Forks a new faktory worker, continuously polls the faktory server for
--- jobs which are passed to @'handler'@. Client is closed when the forked
--- thread is done.
+-- jobs which are passed to @'handler'@. The client is closed when the forked
+-- thread ends.
 startWorker
   :: (HasCallStack, FromJSON args)
   => Settings
@@ -127,10 +127,6 @@ startWorker settings workerSettings handler = do
       )
   pure (tid, worker)
 
--- | Blocks the thread until the worker thread has completed.
-untilWorkerDone :: Worker -> IO ()
-untilWorkerDone Worker{isDone} = takeMVar isDone
-
 -- | Creates a new faktory worker, continuously polls the faktory server for
 --- jobs which are passed to @'handler'@.
 runWorker
@@ -148,6 +144,10 @@ runWorkerEnv f = do
   settings <- envSettings
   workerSettings <- envWorkerSettings
   runWorker settings workerSettings f
+
+-- | Blocks until the worker thread has completed.
+untilWorkerDone :: Worker -> IO ()
+untilWorkerDone Worker{isDone} = takeMVar isDone
 
 -- | Quiet's a worker so that it no longer polls for jobs.
 quietWorker :: Worker -> IO ()

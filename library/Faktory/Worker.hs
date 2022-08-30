@@ -16,7 +16,7 @@ module Faktory.Worker (
 ) where
 
 import Faktory.Prelude
-import Control.Concurrent (MVar, forkFinally, killThread, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (MVar, forkFinally, killThread, newEmptyMVar, putMVar, takeMVar, ThreadId)
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT (runReaderT))
 import Data.Aeson
 import Data.Aeson.Casing
@@ -101,14 +101,14 @@ startWorker
   =>  Settings
   -> WorkerSettings
   -> (Job args -> IO ())
-  -> IO Worker
+  -> IO (ThreadId, Worker)
 startWorker settings workerSettings handler = do
   workerId <- maybe randomWorkerId pure $ settingsId workerSettings
   isQuieted <- newTVarIO False
   client <- newClient settings $ Just workerId
   isDone <- newEmptyMVar
   let worker = Worker{client, workerId, settings, workerSettings, isQuieted, isDone}
-  _ <-
+  tid <-
     finally
       ( forkFinally
           ( do
@@ -123,7 +123,7 @@ startWorker settings workerSettings handler = do
           (\_ -> putMVar isDone ())
       )
       $ closeClient client
-  pure worker
+  pure (tid, worker)
 
 -- | Blocks the thread until the worker thread has completed.
 untilWorkerDone :: Worker -> IO ()
@@ -139,7 +139,7 @@ runWorker
   -> (Job args -> IO ())
   -> IO ()
 runWorker settings workerSettings handler = do
-  worker <- startWorker settings workerSettings handler
+  (_, worker) <- startWorker settings workerSettings handler
   untilWorkerDone worker
 
 runWorkerEnv :: FromJSON args => (Job args -> IO ()) -> IO ()

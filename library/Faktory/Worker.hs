@@ -62,7 +62,7 @@ instance ToJSON AckPayload where
   toJSON = genericToJSON $ aesonPrefix snakeCase
   toEncoding = genericToEncoding $ aesonPrefix snakeCase
 
-newtype WorkerM a = WorkerReader
+newtype WorkerM a = WorkerM
   { runWorkerM :: ReaderT Worker IO a
   }
   deriving newtype (Functor, Applicative, Monad, MonadReader Worker, MonadIO, MonadThrow, MonadCatch, MonadMask)

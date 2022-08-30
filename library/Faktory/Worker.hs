@@ -62,7 +62,7 @@ instance ToJSON AckPayload where
   toJSON = genericToJSON $ aesonPrefix snakeCase
   toEncoding = genericToEncoding $ aesonPrefix snakeCase
 
-newtype WorkerM a = WorkerM
+newtype MonadWorker a = WorkerReader
   { runWorkerM :: ReaderT Worker IO a
   }
   deriving newtype (Functor, Applicative, Monad, MonadReader Worker, MonadIO, MonadThrow, MonadCatch, MonadMask)
@@ -94,11 +94,11 @@ workerID :: Worker -> WorkerId
 workerID Worker{workerId} = workerId
 
 -- | Forks a new faktory worker, continuously polls the faktory server for
--- jobs which are passed to @'handler'@. Returns a Worker state that can be
--- used to quiet the worker.
+-- jobs which are passed to @'handler'@. Client is closed when the forked
+-- thread is done.
 startWorker
   :: (HasCallStack, FromJSON args)
-  =>  Settings
+  => Settings
   -> WorkerSettings
   -> (Job args -> IO ())
   -> IO (ThreadId, Worker)
@@ -107,22 +107,24 @@ startWorker settings workerSettings handler = do
   isQuieted <- newTVarIO False
   client <- newClient settings $ Just workerId
   isDone <- newEmptyMVar
-  let worker = Worker{client, workerId, settings, workerSettings, isQuieted, isDone}
+  let worker = Worker{client, isDone, isQuieted, settings, workerId, workerSettings}
   tid <-
-    finally
-      ( forkFinally
-          ( do
-              beatThreadId <- forkIOWithThrowToParent $ forever $ heartBeat worker
-              finally
-                ( flip runReaderT worker . runWorkerM $
-                    untilM_ shouldStopWorker (processorLoop handler)
-                      `catch` (\(_ex :: WorkerHalt) -> pure ())
-                )
-                $ killThread beatThreadId
-          )
-          (\_ -> putMVar isDone ())
+    forkFinally
+      ( do
+          beatThreadId <- forkIOWithThrowToParent $ forever $ heartBeat worker
+          finally
+            ( flip runReaderT worker . runWorkerM $
+                untilM_ shouldStopWorker (processorLoop handler)
+                  `catch` (\(_ex :: WorkerHalt) -> pure ())
+            )
+            $ killThread beatThreadId
       )
-      $ closeClient client
+      ( \e -> do
+          closeClient client
+          case e of
+            Left err -> throwIO err
+            Right _ -> putMVar isDone ()
+      )
   pure (tid, worker)
 
 -- | Blocks the thread until the worker thread has completed.
@@ -130,8 +132,7 @@ untilWorkerDone :: Worker -> IO ()
 untilWorkerDone Worker{isDone} = takeMVar isDone
 
 -- | Creates a new faktory worker, continuously polls the faktory server for
---- jobs which are passed to @'handler'@. The worker's connection is closed
--- when job processing ends.
+--- jobs which are passed to @'handler'@.
 runWorker
   :: (HasCallStack, FromJSON args)
   => Settings
@@ -153,7 +154,7 @@ quietWorker :: Worker -> IO ()
 quietWorker Worker{isQuieted} = do
   atomically $ writeTVar isQuieted True
 
-shouldStopWorker :: WorkerM Bool
+shouldStopWorker :: MonadWorker Bool
 shouldStopWorker = do
   Worker{isQuieted} <- ask
   liftIO $ readTVarIO isQuieted
@@ -161,7 +162,7 @@ shouldStopWorker = do
 processorLoop
   :: (HasCallStack, FromJSON arg)
   => (Job arg -> IO ())
-  -> WorkerM ()
+  -> MonadWorker ()
 processorLoop f = do
   Worker{settings, workerSettings} <- ask
   let
@@ -190,18 +191,19 @@ heartBeat :: Worker -> IO ()
 heartBeat Worker{client, workerId} = do
   threadDelaySeconds 25
   command_ client "BEAT" [encode $ BeatPayload workerId]
+
 fetchJob
-  :: FromJSON args => Queue -> WorkerM (Either String (Maybe (Job args)))
+  :: FromJSON args => Queue -> MonadWorker (Either String (Maybe (Job args)))
 fetchJob queue = do
   Worker{client} <- ask
   liftIO $ commandJSON client "FETCH" [queueArg queue]
 
-ackJob :: HasCallStack => Job args -> WorkerM ()
+ackJob :: HasCallStack => Job args -> MonadWorker ()
 ackJob job = do
   Worker{client} <- ask
   liftIO $ commandOK client "ACK" [encode $ AckPayload $ jobJid job]
 
-failJob :: HasCallStack => Job args -> Text -> WorkerM ()
+failJob :: HasCallStack => Job args -> Text -> MonadWorker ()
 failJob job message = do
   Worker{client} <- ask
   liftIO $ commandOK client "FAIL" [encode $ FailPayload message "" (jobJid job) []]

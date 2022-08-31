@@ -5,7 +5,7 @@
 --
 module Faktory.Worker (
   WorkerHalt (..),
-  Worker (config),
+  Worker (config, tid),
   WorkerConfig (workerId),
   runWorker,
   runWorkerEnv,

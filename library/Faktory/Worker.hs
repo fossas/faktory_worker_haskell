@@ -114,8 +114,7 @@ startWorker settings workerSettings handler = do
           beatThreadId <- forkIOWithThrowToParent $ forever $ heartBeat worker
           finally
             ( flip runReaderT worker . runWorkerM $
-                untilM_ shouldStopWorker (processorLoop handler)
-                  `catch` (\(_ex :: WorkerHalt) -> pure ())
+                catch (untilM_ shouldStopWorker (processorLoop handler)) (\(_ex :: WorkerHalt) -> pure ())
             )
             $ killThread beatThreadId
       )

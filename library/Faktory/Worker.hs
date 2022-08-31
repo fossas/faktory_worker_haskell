@@ -5,8 +5,7 @@
 --
 module Faktory.Worker (
   WorkerHalt (..),
-  Worker,
-  workerID,
+  Worker (workerId),
   runWorker,
   runWorkerEnv,
   startWorker,
@@ -88,10 +87,6 @@ untilM_ predicate action = do
         void action
         untilM_ predicate action
     )
-
--- | Returns the @'WorkerId' associated with a @'Worker'.
-workerID :: Worker -> WorkerId
-workerID Worker{workerId} = workerId
 
 -- | Forks a new faktory worker, continuously polls the faktory server for
 -- jobs which are passed to @'handler'@. The client is closed when the forked

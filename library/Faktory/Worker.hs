@@ -6,13 +6,13 @@
 module Faktory.Worker (
   WorkerHalt (..),
   Worker (config, tid),
-  WorkerConfig (workerId),
+  jobArg,
+  quietWorker,
   runWorker,
   runWorkerEnv,
   startWorker,
   waitUntilDone,
-  quietWorker,
-  jobArg,
+  workerId,
 ) where
 
 import Faktory.Prelude
@@ -34,7 +34,7 @@ import System.Timeout (timeout)
 data WorkerConfig = WorkerConfig
   { client :: Client
   , settings :: Settings
-  , workerId :: WorkerId
+  , wid :: WorkerId
   , workerSettings :: WorkerSettings
   }
 
@@ -106,11 +106,11 @@ startWorker
   -> (Job args -> IO ())
   -> IO (Worker)
 startWorker settings workerSettings handler = do
-  workerId <- maybe randomWorkerId pure $ settingsId workerSettings
+  wid <- maybe randomWorkerId pure $ settingsId workerSettings
   isQuieted <- newTVarIO False
-  client <- newClient settings $ Just workerId
+  client <- newClient settings $ Just wid
   isDone <- newEmptyMVar
-  let config = WorkerConfig{client, settings, workerId, workerSettings}
+  let config = WorkerConfig{client, settings, wid, workerSettings}
   tid <-
     forkFinally
       ( do
@@ -191,9 +191,9 @@ processorLoop f = do
 
 -- | <https://github.com/contribsys/faktory/wiki/Worker-Lifecycle#heartbeat>
 heartBeat :: WorkerConfig -> IO ()
-heartBeat WorkerConfig{client, workerId} = do
+heartBeat WorkerConfig{client, wid} = do
   threadDelaySeconds 25
-  command_ client "BEAT" [encode $ BeatPayload workerId]
+  command_ client "BEAT" [encode $ BeatPayload wid]
 
 fetchJob
   :: FromJSON args => Queue -> WorkerM (Either String (Maybe (Job args)))
@@ -210,3 +210,6 @@ failJob :: HasCallStack => Job args -> Text -> WorkerM ()
 failJob job message = do
   WorkerConfig{client} <- ask
   liftIO $ commandOK client "FAIL" [encode $ FailPayload message "" (jobJid job) []]
+
+workerId :: Worker -> WorkerId
+workerId Worker{config=WorkerConfig{wid}} = wid

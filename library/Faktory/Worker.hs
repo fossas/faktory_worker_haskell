@@ -96,7 +96,7 @@ untilM_ predicate action = do
         untilM_ predicate action
     )
 
--- | Forks a new faktory worker, continuously polls the faktory server for
+-- | Forks a new faktory worker and continuously polls the faktory server for
 -- jobs which are passed to @'handler'@. The client is closed when the forked
 -- thread ends.
 startWorker
@@ -121,7 +121,7 @@ startWorker settings workerSettings handler = do
                   (untilM_ (liftIO $ readTVarIO isQuieted) (processorLoop handler))
                   (\(_ex :: WorkerHalt) -> pure ())
             )
-            $ killThread beatThreadId
+            (killThread beatThreadId)
       )
       ( \e -> do
           closeClient client
@@ -212,4 +212,4 @@ failJob job message = do
   liftIO $ commandOK client "FAIL" [encode $ FailPayload message "" (jobJid job) []]
 
 workerId :: Worker -> WorkerId
-workerId Worker{config=WorkerConfig{wid}} = wid
+workerId Worker{config = WorkerConfig{wid}} = wid

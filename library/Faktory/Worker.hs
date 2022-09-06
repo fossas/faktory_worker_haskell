@@ -16,11 +16,10 @@ module Faktory.Worker (
 ) where
 
 import Faktory.Prelude
-import Control.Concurrent (MVar, ThreadId, forkFinally, killThread, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (MVar, ThreadId, forkFinally, killThread, newEmptyMVar, putMVar, takeMVar, myThreadId)
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT (runReaderT))
 import Data.Aeson
 import Data.Aeson.Casing
-import Data.Maybe
 import qualified Data.Text as T
 import Faktory.Client
 import Faktory.Job (Job, JobId, jobArg, jobJid, jobReserveForMicroseconds)
@@ -104,13 +103,14 @@ startWorker
   => Settings
   -> WorkerSettings
   -> (Job args -> IO ())
-  -> IO (Worker)
+  -> IO Worker
 startWorker settings workerSettings handler = do
   wid <- maybe randomWorkerId pure $ settingsId workerSettings
   isQuieted <- newTVarIO False
   client <- newClient settings $ Just wid
   isDone <- newEmptyMVar
   let config = WorkerConfig{client, settings, wid, workerSettings}
+  parentThreadId <- myThreadId
   tid <-
     forkFinally
       ( do
@@ -128,9 +128,9 @@ startWorker settings workerSettings handler = do
           putMVar isDone ()
           case e of
             Left err ->
-              when
-                (isNothing $ fromException @WorkerHalt err)
-                (throwIO err)
+              case fromException err of
+                Just (_ :: WorkerHalt) -> pure ()
+                Nothing -> throwTo parentThreadId err
             Right _ -> pure ()
       )
   pure Worker{tid, config, isDone, isQuieted}

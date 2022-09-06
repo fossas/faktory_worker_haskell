@@ -16,7 +16,7 @@ module Faktory.Worker (
 ) where
 
 import Faktory.Prelude
-import Control.Concurrent (MVar, ThreadId, forkFinally, killThread, newEmptyMVar, putMVar, takeMVar, myThreadId)
+import Control.Concurrent (MVar, ThreadId, forkFinally, killThread, myThreadId, newEmptyMVar, putMVar, takeMVar)
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT (runReaderT))
 import Data.Aeson
 import Data.Aeson.Casing

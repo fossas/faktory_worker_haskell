@@ -20,6 +20,7 @@ import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT (runRe
 import Data.Aeson
 import Data.Aeson.Casing
 import qualified Data.Text as T
+import Data.Time.LocalTime (getZonedTime)
 import Faktory.Client
 import Faktory.Job (Job, JobId, jobArg, jobJid, jobReserveForMicroseconds)
 import Faktory.Prelude
@@ -123,12 +124,14 @@ startWorker settings workerSettings handler = do
                     (\(_ex :: WorkerHalt) -> pure ())
               )
                 `catchAny` ( \e -> do
-                              liftIO $ putStrLn $ "EXCEPTION: " <> displayException e
+                              now <- getZonedTime
+                              liftIO $ putStrLn $ show now <> " - EXCEPTION: " <> displayException e
                               throwIO e
                            )
             )
             ( do
-                putStrLn "KILLING HEARTBEAT"
+                now <- getZonedTime
+                putStrLn $ show now <> " - KILLING HEARTBEAT"
                 killThread beatThreadId
             )
       )
@@ -205,7 +208,8 @@ processorLoop f = do
 heartBeat :: WorkerConfig -> IO ()
 heartBeat WorkerConfig{client, wid} = do
   threadDelaySeconds 25
-  putStrLn "BEATING"
+  now <- getZonedTime
+  putStrLn $ show now <> " - BEATING"
   command_ client "BEAT" [encode $ BeatPayload wid]
 
 fetchJob ::

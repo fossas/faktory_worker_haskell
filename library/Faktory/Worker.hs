@@ -193,6 +193,7 @@ processorLoop f = do
 heartBeat :: WorkerConfig -> IO ()
 heartBeat WorkerConfig{client, wid} = do
   threadDelaySeconds 25
+  putStrLn "BEATING"
   command_ client "BEAT" [encode $ BeatPayload wid]
 
 fetchJob

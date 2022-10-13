@@ -121,7 +121,9 @@ startWorker settings workerSettings handler = do
                   (untilM_ (liftIO $ readTVarIO isQuieted) (processorLoop handler))
                   (\(_ex :: WorkerHalt) -> pure ())
             )
-            (killThread beatThreadId)
+            (do
+              putStrLn "KILLING HEARTBEAT"
+              killThread beatThreadId)
       )
       ( \e -> do
           closeClient client

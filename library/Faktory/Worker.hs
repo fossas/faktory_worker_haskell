@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -Wno-overlapping-patterns #-}
 -- | High-level interface for a Worker
 --
 -- Runs forever, @FETCH@-ing Jobs from the given Queue and handing each to your
@@ -190,11 +191,12 @@ processorLoop f = do
     Left err -> liftIO $ settingsLogError settings $ "Invalid Job: " <> err
     Right Nothing -> liftIO $ threadDelaySeconds $ settingsIdleDelay workerSettings
     Right (Just job) ->
-      processAndAck job
-        `catches` [ Handler $ \(ex :: WorkerHalt) -> throw ex
-                  , Handler $ \(ex :: SomeException) ->
-                    failJob job $ T.pack $ show ex
-                  ]
+      withException
+        (withException
+          (processAndAck job)
+          (\(ex :: WorkerHalt) -> throw ex))
+        (\(e :: SomeException) -> failJob job $ T.pack $ show e)
+
 
 -- | <https://github.com/contribsys/faktory/wiki/Worker-Lifecycle#heartbeat>
 heartBeat :: WorkerConfig -> IO ()

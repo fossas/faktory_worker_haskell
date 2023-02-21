@@ -1,4 +1,3 @@
-{-# OPTIONS_GHC -Wno-overlapping-patterns #-}
 -- | High-level interface for a Worker
 --
 -- Runs forever, @FETCH@-ing Jobs from the given Queue and handing each to your

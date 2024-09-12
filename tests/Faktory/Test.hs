@@ -22,7 +22,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import Faktory.Settings
-import Faktory.Worker
+import Faktory.Worker hiding (startWorker)
 
 workerTestCase :: HasCallStack => (Producer -> IO ()) -> IO [Job Text]
 workerTestCase = workerTestCaseWith id
